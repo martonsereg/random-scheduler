@@ -2,40 +2,51 @@ package main
 
 import (
 	"fmt"
+	"log"
+	"math/rand"
+	"time"
+
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/api/core/v1"
-	"log"
-	"time"
-	"math/rand"
 )
 
 const schedulerName = "random-scheduler"
+
+type Scheduler struct {
+	clientset  *kubernetes.Clientset
+}
+
+func NewScheduler() Scheduler {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return Scheduler{
+		clientset:  clientset,
+	}
+}
 
 func main() {
 	fmt.Println("I'm a scheduler!")
 
 	rand.Seed(time.Now().Unix())
 
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	err = schedulePods(clientset)
+	scheduler := NewScheduler()
+	scheduler.SchedulePods()
 
 }
 
-func schedulePods(clientset *kubernetes.Clientset) error {
-	watch, err := clientset.CoreV1().Pods("").Watch(metav1.ListOptions{
+func (s *Scheduler) SchedulePods() error {
+
+	watch, err := s.clientset.CoreV1().Pods("").Watch(metav1.ListOptions{
 		FieldSelector: fmt.Sprintf("spec.schedulerName=%s,spec.nodeName=", schedulerName),
 	})
 	if err != nil {
@@ -55,13 +66,13 @@ func schedulePods(clientset *kubernetes.Clientset) error {
 
 		fmt.Println("found a pod to schedule:", p.Namespace, "/", p.Name)
 
-		node, err := findFit(clientset)
+		node, err := s.findFit()
 		if err != nil {
 			log.Println("cannot find node that fits pod", err.Error())
 			continue
 		}
 
-		err = bindPod(clientset, p, node)
+		err = s.bindPod(p, node)
 		if err != nil {
 			log.Println("failed to bind pod", err.Error())
 			continue
@@ -69,7 +80,7 @@ func schedulePods(clientset *kubernetes.Clientset) error {
 
 		message := fmt.Sprintf("Placed pod [%s/%s] on %s\n", p.Namespace, p.Name, node.Name)
 
-		err = emitEvent(clientset, p, message)
+		err = s.emitEvent(p, message)
 		if err != nil {
 			log.Println("failed to emit scheduled event", err.Error())
 			continue
@@ -80,16 +91,16 @@ func schedulePods(clientset *kubernetes.Clientset) error {
 	return nil
 }
 
-func findFit(clientset *kubernetes.Clientset) (*v1.Node, error) {
-	nodes, err := clientset.CoreV1().Nodes().List(metav1.ListOptions{})
+func (s *Scheduler) findFit() (*v1.Node, error) {
+	nodes, err := s.clientset.CoreV1().Nodes().List(metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
 	return &nodes.Items[rand.Intn(len(nodes.Items))], nil
 }
 
-func bindPod(clientset *kubernetes.Clientset, p *v1.Pod, randomNode *v1.Node) error {
-	return clientset.CoreV1().Pods(p.Namespace).Bind(&v1.Binding{
+func (s *Scheduler) bindPod(p *v1.Pod, randomNode *v1.Node) error {
+	return s.clientset.CoreV1().Pods(p.Namespace).Bind(&v1.Binding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      p.Name,
 			Namespace: p.Namespace,
@@ -102,9 +113,9 @@ func bindPod(clientset *kubernetes.Clientset, p *v1.Pod, randomNode *v1.Node) er
 	})
 }
 
-func emitEvent(clientset *kubernetes.Clientset, p *v1.Pod, message string) error {
+func (s *Scheduler) emitEvent(p *v1.Pod, message string) error {
 	timestamp := time.Now().UTC()
-	_, err := clientset.CoreV1().Events(p.Namespace).Create(&v1.Event{
+	_, err := s.clientset.CoreV1().Events(p.Namespace).Create(&v1.Event{
 		Count:          1,
 		Message:        message,
 		Reason:         "Scheduled",
