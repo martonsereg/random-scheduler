@@ -14,6 +14,7 @@ import (
 	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 const schedulerName = "random-scheduler"
@@ -87,38 +88,39 @@ func main() {
 	defer close(quit)
 
 	scheduler := NewScheduler(podQueue, quit)
-	scheduler.SchedulePods()
+	scheduler.Run(quit)
 }
 
-func (s *Scheduler) SchedulePods() error {
+func (s *Scheduler) Run(quit chan struct{}) {
+	wait.Until(s.ScheduleOne, 0, quit)
+}
 
-	for p := range s.podQueue {
+func (s *Scheduler) ScheduleOne() {
 
-		fmt.Println("found a pod to schedule:", p.Namespace, "/", p.Name)
+	p := <-s.podQueue
+	fmt.Println("found a pod to schedule:", p.Namespace, "/", p.Name)
 
-		node, err := s.findFit()
-		if err != nil {
-			log.Println("cannot find node that fits pod", err.Error())
-			continue
-		}
-
-		err = s.bindPod(p, node)
-		if err != nil {
-			log.Println("failed to bind pod", err.Error())
-			continue
-		}
-
-		message := fmt.Sprintf("Placed pod [%s/%s] on %s\n", p.Namespace, p.Name, node.Name)
-
-		err = s.emitEvent(p, message)
-		if err != nil {
-			log.Println("failed to emit scheduled event", err.Error())
-			continue
-		}
-
-		fmt.Println(message)
+	node, err := s.findFit()
+	if err != nil {
+		log.Println("cannot find node that fits pod", err.Error())
+		return
 	}
-	return nil
+
+	err = s.bindPod(p, node)
+	if err != nil {
+		log.Println("failed to bind pod", err.Error())
+		return
+	}
+
+	message := fmt.Sprintf("Placed pod [%s/%s] on %s\n", p.Namespace, p.Name, node.Name)
+
+	err = s.emitEvent(p, message)
+	if err != nil {
+		log.Println("failed to emit scheduled event", err.Error())
+		return
+	}
+
+	fmt.Println(message)
 }
 
 func (s *Scheduler) findFit() (*v1.Node, error) {
