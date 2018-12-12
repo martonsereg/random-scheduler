@@ -5,7 +5,7 @@ OS = $(shell uname -s)
 PACKAGE = github.com/martonsereg/scheduler
 BINARY_NAME = scheduler
 IMAGE = martonsereg/scheduler
-TAG = v0.1
+TAG = v0.2
 
 # Build variables
 BUILD_DIR ?= build

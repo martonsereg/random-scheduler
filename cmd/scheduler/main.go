@@ -8,17 +8,23 @@ import (
 
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/informers"
+	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
+	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 )
 
 const schedulerName = "random-scheduler"
 
 type Scheduler struct {
 	clientset  *kubernetes.Clientset
+	nodeLister listersv1.NodeLister
 }
 
-func NewScheduler() Scheduler {
+func NewScheduler(stopCh chan struct{}) Scheduler {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		log.Fatal(err)
@@ -31,7 +37,29 @@ func NewScheduler() Scheduler {
 
 	return Scheduler{
 		clientset:  clientset,
+		nodeLister: initInformers(clientset, stopCh),
 	}
+}
+
+func initInformers(clientset *kubernetes.Clientset, stopCh chan struct{}) listersv1.NodeLister {
+	factory := informers.NewSharedInformerFactory(clientset, 0)
+
+	var nodeInformer coreinformers.NodeInformer
+	nodeInformer = factory.Core().V1().Nodes()
+
+	nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			node, ok := obj.(*v1.Node)
+			if !ok {
+				log.Println("this is not a node")
+				return
+			}
+			log.Printf("New Node Added to Store: %s", node.GetName())
+		},
+	})
+
+	factory.Start(stopCh)
+	return nodeInformer.Lister()
 }
 
 func main() {
@@ -39,9 +67,11 @@ func main() {
 
 	rand.Seed(time.Now().Unix())
 
-	scheduler := NewScheduler()
-	scheduler.SchedulePods()
+	stopCh := make(chan struct{})
+	defer close(stopCh)
 
+	scheduler := NewScheduler(stopCh)
+	scheduler.SchedulePods()
 }
 
 func (s *Scheduler) SchedulePods() error {
@@ -92,11 +122,11 @@ func (s *Scheduler) SchedulePods() error {
 }
 
 func (s *Scheduler) findFit() (*v1.Node, error) {
-	nodes, err := s.clientset.CoreV1().Nodes().List(metav1.ListOptions{})
+	nodes, err := s.nodeLister.List(labels.Everything())
 	if err != nil {
 		return nil, err
 	}
-	return &nodes.Items[rand.Intn(len(nodes.Items))], nil
+	return nodes[rand.Intn(len(nodes))], nil
 }
 
 func (s *Scheduler) bindPod(p *v1.Pod, randomNode *v1.Node) error {
