@@ -15,14 +15,20 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"errors"
 )
 
 const schedulerName = "random-scheduler"
+
+type predicateFunc func(node *v1.Node, pod *v1.Pod) bool
+type priorityFunc func(node *v1.Node, pod *v1.Pod) int
 
 type Scheduler struct {
 	clientset  *kubernetes.Clientset
 	podQueue   chan *v1.Pod
 	nodeLister listersv1.NodeLister
+	predicates []predicateFunc
+	priorities []priorityFunc
 }
 
 func NewScheduler(podQueue chan *v1.Pod, quit chan struct{}) Scheduler {
@@ -40,6 +46,12 @@ func NewScheduler(podQueue chan *v1.Pod, quit chan struct{}) Scheduler {
 		clientset:  clientset,
 		podQueue:   podQueue,
 		nodeLister: initInformers(clientset, podQueue, quit),
+		predicates: []predicateFunc{
+			randomPredicate,
+		},
+		priorities: []priorityFunc{
+			randomPriority,
+		},
 	}
 }
 
@@ -100,7 +112,7 @@ func (s *Scheduler) ScheduleOne() {
 	p := <-s.podQueue
 	fmt.Println("found a pod to schedule:", p.Namespace, "/", p.Name)
 
-	node, err := s.findFit()
+	node, err := s.findFit(p)
 	if err != nil {
 		log.Println("cannot find node that fits pod", err.Error())
 		return
@@ -112,7 +124,7 @@ func (s *Scheduler) ScheduleOne() {
 		return
 	}
 
-	message := fmt.Sprintf("Placed pod [%s/%s] on %s\n", p.Namespace, p.Name, node.Name)
+	message := fmt.Sprintf("Placed pod [%s/%s] on %s\n", p.Namespace, p.Name, node)
 
 	err = s.emitEvent(p, message)
 	if err != nil {
@@ -123,15 +135,21 @@ func (s *Scheduler) ScheduleOne() {
 	fmt.Println(message)
 }
 
-func (s *Scheduler) findFit() (*v1.Node, error) {
+func (s *Scheduler) findFit(pod *v1.Pod) (string, error) {
 	nodes, err := s.nodeLister.List(labels.Everything())
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	return nodes[rand.Intn(len(nodes))], nil
+
+	filteredNodes := s.runPredicates(nodes, pod)
+	if len(filteredNodes) == 0 {
+		return "", errors.New("failed to find node that fits pod")
+	}
+	priorities := s.prioritize(filteredNodes, pod)
+	return s.findBestNode(priorities), nil
 }
 
-func (s *Scheduler) bindPod(p *v1.Pod, randomNode *v1.Node) error {
+func (s *Scheduler) bindPod(p *v1.Pod, node string) error {
 	return s.clientset.CoreV1().Pods(p.Namespace).Bind(&v1.Binding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      p.Name,
@@ -140,7 +158,7 @@ func (s *Scheduler) bindPod(p *v1.Pod, randomNode *v1.Node) error {
 		Target: v1.ObjectReference{
 			APIVersion: "v1",
 			Kind:       "Node",
-			Name:       randomNode.Name,
+			Name:       node,
 		},
 	})
 }
@@ -171,4 +189,59 @@ func (s *Scheduler) emitEvent(p *v1.Pod, message string) error {
 		return err
 	}
 	return nil
+}
+
+func (s *Scheduler) runPredicates(nodes []*v1.Node, pod *v1.Pod) []*v1.Node {
+	filteredNodes := make([]*v1.Node, 0)
+	for _, node := range nodes {
+		if s.predicatesApply(node, pod) {
+			filteredNodes = append(filteredNodes, node)
+		}
+	}
+	log.Println("nodes that fit:")
+	for _, n := range filteredNodes {
+		log.Println(n.Name)
+	}
+	return filteredNodes
+}
+
+func (s *Scheduler) predicatesApply(node *v1.Node, pod *v1.Pod) bool {
+	for _, predicate := range s.predicates {
+		if !predicate(node, pod) {
+			return false
+		}
+	}
+	return true
+}
+
+func randomPredicate(node *v1.Node, pod *v1.Pod) bool {
+	r := rand.Intn(2)
+	return r == 0
+}
+
+func (s *Scheduler) prioritize(nodes []*v1.Node, pod *v1.Pod) map[string]int {
+	priorities := make(map[string]int)
+	for _, node := range nodes {
+		for _, priority := range s.priorities {
+			priorities[node.Name] += priority(node, pod)
+		}
+	}
+	log.Println("calculated priorities:", priorities)
+	return priorities
+}
+
+func (s *Scheduler) findBestNode(priorities map[string]int) string {
+	var maxP int
+	var bestNode string
+	for node, p := range priorities {
+		if p > maxP {
+			maxP = p
+			bestNode = node
+		}
+	}
+	return bestNode
+}
+
+func randomPriority(node *v1.Node, pod *v1.Pod) int {
+	return rand.Intn(100)
 }
