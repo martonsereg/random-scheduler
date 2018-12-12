@@ -10,7 +10,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
-	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
@@ -21,10 +20,11 @@ const schedulerName = "random-scheduler"
 
 type Scheduler struct {
 	clientset  *kubernetes.Clientset
+	podQueue   chan *v1.Pod
 	nodeLister listersv1.NodeLister
 }
 
-func NewScheduler(stopCh chan struct{}) Scheduler {
+func NewScheduler(podQueue chan *v1.Pod, quit chan struct{}) Scheduler {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		log.Fatal(err)
@@ -37,16 +37,15 @@ func NewScheduler(stopCh chan struct{}) Scheduler {
 
 	return Scheduler{
 		clientset:  clientset,
-		nodeLister: initInformers(clientset, stopCh),
+		podQueue:   podQueue,
+		nodeLister: initInformers(clientset, podQueue, quit),
 	}
 }
 
-func initInformers(clientset *kubernetes.Clientset, stopCh chan struct{}) listersv1.NodeLister {
+func initInformers(clientset *kubernetes.Clientset, podQueue chan *v1.Pod, quit chan struct{}) listersv1.NodeLister {
 	factory := informers.NewSharedInformerFactory(clientset, 0)
 
-	var nodeInformer coreinformers.NodeInformer
-	nodeInformer = factory.Core().V1().Nodes()
-
+	nodeInformer := factory.Core().V1().Nodes()
 	nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			node, ok := obj.(*v1.Node)
@@ -58,7 +57,21 @@ func initInformers(clientset *kubernetes.Clientset, stopCh chan struct{}) lister
 		},
 	})
 
-	factory.Start(stopCh)
+	podInformer := factory.Core().V1().Pods()
+	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			pod, ok := obj.(*v1.Pod)
+			if !ok {
+				log.Println("this is not a pod")
+				return
+			}
+			if pod.Spec.NodeName == "" && pod.Spec.SchedulerName == schedulerName {
+				podQueue <- pod
+			}
+		},
+	})
+
+	factory.Start(quit)
 	return nodeInformer.Lister()
 }
 
@@ -67,32 +80,19 @@ func main() {
 
 	rand.Seed(time.Now().Unix())
 
-	stopCh := make(chan struct{})
-	defer close(stopCh)
+	podQueue := make(chan *v1.Pod, 300)
+	defer close(podQueue)
 
-	scheduler := NewScheduler(stopCh)
+	quit := make(chan struct{})
+	defer close(quit)
+
+	scheduler := NewScheduler(podQueue, quit)
 	scheduler.SchedulePods()
 }
 
 func (s *Scheduler) SchedulePods() error {
 
-	watch, err := s.clientset.CoreV1().Pods("").Watch(metav1.ListOptions{
-		FieldSelector: fmt.Sprintf("spec.schedulerName=%s,spec.nodeName=", schedulerName),
-	})
-	if err != nil {
-		log.Println("error when watching pods", err.Error())
-		return err
-	}
-
-	for event := range watch.ResultChan() {
-		if event.Type != "ADDED" {
-			continue
-		}
-		p, ok := event.Object.(*v1.Pod)
-		if !ok {
-			fmt.Println("unexpected type")
-			continue
-		}
+	for p := range s.podQueue {
 
 		fmt.Println("found a pod to schedule:", p.Namespace, "/", p.Name)
 
